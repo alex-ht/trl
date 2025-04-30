@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import textwrap
 import warnings
 from collections import defaultdict, deque
@@ -43,6 +44,12 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available
+from RestrictedPython import compile_restricted
+from RestrictedPython.PrintCollector import PrintCollector
+from RestrictedPython.Guards import safe_builtins
+_print_ = PrintCollector
+_getattr_ = getattr
+restricted_globals = dict(__builtins__=safe_builtins)
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
@@ -980,6 +987,44 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
+                completion_ids = []
+                for prompt in all_prompts_text:
+                    partial = ""
+                    remain_function_call = 5
+                    local_vars = {}
+                    while True:
+                        completion_id = self.vllm_client.generate(
+                            prompts=[prompt + partial],
+                            n=1,
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=self.max_completion_length,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                        )
+                        remain_function_call -= 1
+                        if completion_id[-1] == self.processing_class.eos_token_id or remain_function_call < 0:
+                            completion_ids.append(self.processing_class.encode(partial) + completion_id)
+                            break
+                        
+                        # run python code
+                        text = self.processing_class.decode(completion_id)
+                        def extract_last_tool_call_content(text):
+                            pattern = r'<tool_call>(.*?)</tool_call>'
+                            matches = re.findall(pattern, text, re.DOTALL)
+                            return matches[-1] if matches else None
+                        
+                        src = extract_last_tool_call_content(text)
+                        assert src is not None
+                        
+                        code = compile_restricted(src, '<string>', 'exec')
+                        exec(code, restricted_globals, local_vars)
+                        assert 'printed' in local_vars
+                        result = local_vars['printed']
+                        partial += f"{text}\n```output\n{result.strip()}\n```\n```system\nRemaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that.\n```\n"
+
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                 # prompt individually.
@@ -996,6 +1041,7 @@ class GRPOTrainer(Trainer):
                         max_tokens=self.max_completion_length,
                         guided_decoding_regex=self.guided_decoding_regex,
                     )
+                            
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
