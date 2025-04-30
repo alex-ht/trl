@@ -1023,7 +1023,11 @@ class GRPOTrainer(Trainer):
                         exec(code, restricted_globals, local_vars)
                         assert 'printed' in local_vars
                         result = local_vars['printed']
-                        partial += f"{text}\n```output\n{result.strip()}\n```\n```system\nRemaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that.\n```\n"
+                        partial += f"{text}\n```output\n{result.strip()}\n```\n"
+                        if remain_function_call == 0:
+                            partial += f"```system\nYou have run out of code executions! You can no longer write or execute code. Now you should continue solving the problem by relying on your mathematical reasoning and analytical skills.\n```\n"
+                        else:
+                            partial += f"```system\nRemaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that.\n```\n"
 
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
