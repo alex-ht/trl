@@ -69,6 +69,14 @@ from .utils import (
     selective_log_softmax,
 )
 
+### TIR
+from RestrictedPython import compile_restricted
+from RestrictedPython.PrintCollector import PrintCollector
+from RestrictedPython.Guards import safe_builtins
+_print_ = PrintCollector
+_getattr_ = getattr
+restricted_globals = dict(__builtins__=safe_builtins)
+### end of TIR
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -1512,9 +1520,7 @@ class GRPOTrainer(Trainer):
                     vllm_inputs = all_prompts_text
 
                 with profiling_context(self, "vLLM.generate"):
-                    all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
-
-                completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+                    completion_ids = self.tir(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
 
                 if self.vllm_tensor_parallel_size > 1:
                     # Slice completions for this rank within its TP group.
@@ -1761,6 +1767,44 @@ class GRPOTrainer(Trainer):
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
+    
+    def tir(self, vllm_inputs, sampling_params, use_tqdm=False):
+        completion_ids = []
+        for prompt in vllm_inputs:
+            partial = ""
+            remain_function_call = 5
+            local_vars = {}
+            while True:
+                completion_id = self.llm.generate(
+                    prompts=[prompt + partial],
+                    sampling_params=sampling_params,
+                    use_tqdm=use_tqdm,
+                )[0][0].token_ids
+                remain_function_call -= 1
+                if completion_id[-1] == self.processing_class.eos_token_id or remain_function_call < 0:
+                    completion_ids.append(self.processing_class.encode(partial) + completion_id)
+                    break
+
+                # run python code
+                text = self.processing_class.decode(completion_id)
+                def extract_last_tool_call_content(text):
+                    pattern = r'<tool_call>(.*?)</tool_call>'
+                    matches = re.findall(pattern, text, re.DOTALL)
+                    return matches[-1] if matches else None
+
+                src = extract_last_tool_call_content(text)
+                assert src is not None
+
+                code = compile_restricted(src, '<string>', 'exec')
+                exec(code, restricted_globals, local_vars)
+                assert 'printed' in local_vars
+                result = local_vars['printed']
+                partial += f"{text}\n```output\n{result.strip()}\n```\n"
+                if remain_function_call == 0:
+                    partial += f"```system\nYou have run out of code executions! You can no longer write or execute code. Now you should continue solving the problem by relying on your mathematical reasoning and analytical skills.\n```\n"
+                else:
+                    partial += f"```system\nRemaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that.\n```\n"
+        return completion_ids
 
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
