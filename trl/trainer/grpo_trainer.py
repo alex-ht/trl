@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import copy
 import inspect
 import os
@@ -1488,6 +1489,7 @@ class GRPOTrainer(Trainer):
                     "min_p": 0.0 if self.min_p is None else self.min_p,
                     "max_tokens": self.max_completion_length,
                     "guided_decoding": guided_decoding,
+                    "skip_special_tokens": False,
                 }
                 if self.args.generation_kwargs is not None:
                     generation_kwargs.update(self.args.generation_kwargs)
@@ -1792,29 +1794,40 @@ class GRPOTrainer(Trainer):
                     use_tqdm=use_tqdm,
                 )[0].outputs[0].token_ids
                 remain_function_call -= 1
-                if completion_id[-1] == self.processing_class.eos_token_id or remain_function_call < 0:
+                # 9 = [TOOL_CALLS] 
+                if 9 not in completion_id or remain_function_call < 0:
                     completion_ids.append(self.processing_class.encode(partial) + completion_id)
                     break
 
                 # run python code
                 text = self.processing_class.decode(completion_id)
                 def extract_last_tool_call_content(text):
-                    pattern = r'<tool_call>(.*?)</tool_call>'
+                    pattern = r'[TOOL_CALLS](.*?)</s>'
                     matches = re.findall(pattern, text, re.DOTALL)
                     return matches[-1] if matches else None
 
                 src = extract_last_tool_call_content(text)
+                try:
+                    finfo = json.loads(src.strip())
+                    src = ""
+                    assert isinstance(finfo, list)
+                    for x in finfo:
+                        arg_str = ", ".join(f"{k}={repr(v)}" for k, v in x['arguments'].items())
+                        src += f"{x['name']}({arg_str})\n"
+                except:
+                    src = ""
                 assert src is not None
                 src = py_tools + '\n' + src
                 code = compile_restricted(src, '<string>', 'exec')
                 exec(code, restricted_globals, local_vars)
                 assert 'printed' in local_vars
-                result = local_vars['printed']
-                partial += f"{text}\n```output\n{result.strip()}\n```\n"
+                result = dict(content=local_vars['printed'])
                 if remain_function_call == 0:
-                    partial += f"```system\nYou have run out of code executions! You can no longer write or execute code. Now you should continue solving the problem by relying on your mathematical reasoning and analytical skills.\n```\n"
+                    result['system'] = f"You have run out of code executions! You can no longer write or execute code. Now you should continue solving the problem by relying on your mathematical reasoning and analytical skills."
                 else:
-                    partial += f"```system\nRemaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that.\n```\n"
+                    result['system'] = f"Remaining code executions: {remain_function_call}. You will not be able to call code when you run out of executions, so use it wisely. Note that you can still continue solving the problem without code after that."
+                result = json.dumps(result, ensure_ascii=False)
+                partial += f"{text}[TOOL_RESULTS]{result}[/TOOL_RESULTS]"
         return completion_ids
 
     def compute_liger_loss(self, unwrapped_model, inputs):
