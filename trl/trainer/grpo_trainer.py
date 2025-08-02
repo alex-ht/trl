@@ -1790,7 +1790,7 @@ class GRPOTrainer(Trainer):
                     prompts=[prompt + partial],
                     sampling_params=sampling_params,
                     use_tqdm=use_tqdm,
-                )[0][0].token_ids
+                )[0].outputs[0].token_ids
                 remain_function_call -= 1
                 if completion_id[-1] == self.processing_class.eos_token_id or remain_function_call < 0:
                     completion_ids.append(self.processing_class.encode(partial) + completion_id)
