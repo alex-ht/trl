@@ -1383,6 +1383,8 @@ class GRPOTrainer(Trainer):
                                 message["content"] = [{"type": "image"}, {"type": "text", "text": content}]
                             elif role == "system":
                                 message["content"] = [{"type": "text", "text": content}]
+        has_py_tools = "python_functions" in inputs[0]
+        py_tools = [example['python_functions'] for example in inputs]
 
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
@@ -1505,9 +1507,15 @@ class GRPOTrainer(Trainer):
                         all_images = [img for sublist in gathered_images for img in sublist]
                     else:
                         all_images = None
+                        
+                    if has_py_tools:
+                        gathered_py_tools = [None for _ in range(self.vllm_tensor_parallel_size)]
+                        torch.distributed.all_gather_object(gathered_py_tools, py_tools, group=self.tp_group)
+                        all_py_tools = [tool for sublist in gathered_py_tools for tool in sublist]
                 else:
                     all_prompts_text = prompts_text
                     all_images = images if has_images else None
+                    all_py_tools = py_tools if has_py_tools else None
 
                 if has_images and all_images:
                     vllm_inputs = []
@@ -1520,7 +1528,7 @@ class GRPOTrainer(Trainer):
                     vllm_inputs = all_prompts_text
 
                 with profiling_context(self, "vLLM.generate"):
-                    completion_ids = self.tir(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
+                    completion_ids = self.tir(vllm_inputs, sampling_params=sampling_params, all_py_tools=all_py_tools, use_tqdm=False)
 
                 if self.vllm_tensor_parallel_size > 1:
                     # Slice completions for this rank within its TP group.
@@ -1768,9 +1776,12 @@ class GRPOTrainer(Trainer):
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
     
-    def tir(self, vllm_inputs, sampling_params, use_tqdm=False):
+    def tir(self, vllm_inputs, sampling_params, all_py_tools=None, use_tqdm=False):
         completion_ids = []
-        for prompt in vllm_inputs:
+        if not isinstance(all_py_tools, dict):
+            py_tools = [""] * len(vllm_inputs)
+
+        for prompt, py_tools in zip(vllm_inputs, all_py_tools):
             partial = ""
             remain_function_call = 5
             local_vars = {}
@@ -1794,7 +1805,7 @@ class GRPOTrainer(Trainer):
 
                 src = extract_last_tool_call_content(text)
                 assert src is not None
-
+                src = py_tools + '\n' + src
                 code = compile_restricted(src, '<string>', 'exec')
                 exec(code, restricted_globals, local_vars)
                 assert 'printed' in local_vars
