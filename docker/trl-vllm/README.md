@@ -27,7 +27,12 @@ Includes (among others):
 
 This Dockerfile installs on top of the base image:
 
-- **TRL** (from the local repository at `/workspace/trl`) with extras: `deepspeed`, `kernels`, `liger`, `peft`, `quantization`, `scikit`, `vlm`, `math_verify`
+- **TRL** (from the local repository at `/workspace/trl`) with extras: `deepspeed`, `kernels`, `peft`, `quantization`, `scikit`, `vlm`, `math_verify`
+- **Liger Kernel** installed from the latest [`linkedin/Liger-Kernel`](https://github.com/linkedin/Liger-Kernel) on GitHub
+- **`kernels`** pinned to `>=0.11.0,<0.13` (required kernel API version)
+- **Flash Attention 3** for H100, built from source in [`Dao-AILab/flash-attention`](https://github.com/Dao-AILab/flash-attention) (`hopper/`) against the container's PyTorch
+
+  The build targets Hopper only (`sm_90a`) and uses the C++11 ABI required by NVIDIA containers. Hub kernels are not used because pre-built wheels fail to load on NVIDIA's custom PyTorch build.
 - **nano** and **vi** (`vim-tiny`) text editors
 - **git** and **libaio-dev** (required for DeepSpeed ZeRO offload)
 
@@ -43,7 +48,7 @@ docker build -t trl-vllm:h100 -f docker/trl-vllm/Dockerfile .
 
 The build context must be the repository root so the Dockerfile can `ADD` the TRL source tree into the image.
 
-The first build can take 10–30 minutes because DeepSpeed CUDA ops are compiled for H100 during installation.
+The first build can take 1–2 hours because DeepSpeed and Flash Attention 3 CUDA kernels are compiled for H100 during installation.
 
 ## Run
 
@@ -70,6 +75,18 @@ docker run --gpus all -it --rm \
   trl-vllm:h100
 ```
 
+## Flash Attention 3 training
+
+Use the installed `flash_attn_3` package when launching TRL scripts on H100:
+
+```bash
+accelerate launch \
+    --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
+    examples/scripts/sft_gpt_oss.py \
+    --attn_implementation flash_attention_3 \
+    --dtype bfloat16
+```
+
 ## DeepSpeed training
 
 Use an Accelerate config with DeepSpeed, for example ZeRO Stage 2:
@@ -87,3 +104,7 @@ Ready-to-use configs are in [`examples/accelerate_configs/`](../../examples/acce
 | `TORCH_CUDA_ARCH_LIST` | `9.0` | Compile CUDA extensions for H100 |
 | `DS_SKIP_CUDA_CHECK` | `1` | Skip DeepSpeed CUDA version check during build |
 | `DS_BUILD_*` | `1` | Build selected DeepSpeed CUDA ops at image build time |
+| `FLASH_ATTENTION_FORCE_BUILD` | `TRUE` | Build FA3 from source instead of downloading wheels |
+| `FLASH_ATTENTION_FORCE_CXX11_ABI` | `TRUE` | Match NVIDIA container PyTorch ABI |
+| `FLASH_ATTENTION_DISABLE_SM80` | `TRUE` | Skip Ampere kernels; build Hopper (H100) only |
+| `MAX_JOBS` / `NVCC_THREADS` | `4` | Parallel FA3 compilation |
